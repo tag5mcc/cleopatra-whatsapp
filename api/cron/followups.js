@@ -11,9 +11,15 @@ const { db, getSetting } = require('../../lib/db');
 const wa = require('../../lib/whatsapp');
 
 module.exports = async function handler(req, res) {
+  // Três formas de autorizar, porque no plano Hobby quem dispara isto é um
+  // agendador externo (cron-job.org, UptimeRobot etc), que nem sempre
+  // permite cabeçalhos personalizados. O segredo na URL resolve.
+  const secret = process.env.INTERNAL_SECRET;
   const isVercelCron = req.headers['user-agent']?.includes('vercel-cron');
-  const hasSecret = req.headers['x-internal-secret'] === process.env.INTERNAL_SECRET;
-  if (!isVercelCron && !hasSecret) {
+  const hasHeader = secret && req.headers['x-internal-secret'] === secret;
+  const hasQuery = secret && req.query?.secret === secret;
+
+  if (!isVercelCron && !hasHeader && !hasQuery) {
     return res.status(401).json({ error: 'Não autorizado.' });
   }
 
