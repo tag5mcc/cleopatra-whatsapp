@@ -1,9 +1,1 @@
-{
-  "name": "segredo-de-cleopatra-chat",
-  "version": "2.0.0",
-  "private": true,
-  "dependencies": {
-    "redis": "^4.6.13",
-    "@supabase/supabase-js": "^2.45.0"
-  }
-}
+
