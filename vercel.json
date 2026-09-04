@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "// regions": "pdx1 = Portland (AWS us-west-2), a mesma região do Supabase. O motor faz dezenas de consultas sequenciais por mensagem; com Vercel e banco em costas opostas dos EUA, cada uma custa ~60ms e a resposta da Cleópatra fica visivelmente lenta.",
+  "regions": ["pdx1"],
+
+  "crons": [
+    { "path": "/api/cron/followups", "schedule": "*/10 * * * *" }
+  ],
+  "functions": {
+    "api/whatsapp/process.js":       { "maxDuration": 120 },
+    "api/whatsapp/webhook.js":       { "maxDuration": 15 },
+    "api/cron/followups.js":         { "maxDuration": 60 },
+    "api/payments/kiwify-webhook.js": { "maxDuration": 30 }
+  }
+}
