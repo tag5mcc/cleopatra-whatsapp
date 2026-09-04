@@ -2,8 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "regions": ["pdx1"],
   "functions": {
+    "api/whatsapp/webhook.js": { "maxDuration": 60 },
     "api/whatsapp/process.js": { "maxDuration": 60 },
-    "api/whatsapp/webhook.js": { "maxDuration": 15 },
     "api/cron/followups.js": { "maxDuration": 60 },
     "api/payments/kiwify-webhook.js": { "maxDuration": 30 }
   }
