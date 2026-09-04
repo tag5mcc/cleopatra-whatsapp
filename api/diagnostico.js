@@ -1,0 +1,1 @@
+https://cleopatra-whatsapp.vercel.app/api/diagnostico?secret=4f37a584d66f9090e020a5553f67a8fdd5b15302cbce00b5989ece053272804b&to=554197382212
