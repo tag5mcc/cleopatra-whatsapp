@@ -1,108 +1,146 @@
-// Recebe as notificações da Kiwify quando alguém compra, renova, cancela
-// ou tem reembolso/chargeback, e atualiza quem tem acesso liberado ao chat.
+// Webhook oficial da WhatsApp Cloud API.
 //
-// Configure este webhook no painel da Kiwify (Apps -> Webhooks -> Criar webhook):
-//   URL do Webhook: https://SEU-SITE.vercel.app/api/kiwify-webhook?token=SEU_SEGREDO
-//   Eventos a marcar: todos os relacionados a pedido/assinatura
+// A Meta espera resposta em poucos segundos, e o ciclo completo da Cleópatra
+// leva mais que isso. Por isso o webhook só grava na fila e aciona o worker.
 //
-// A variável de ambiente KIWIFY_WEBHOOK_SECRET na Vercel precisa ter o MESMO
-// valor que você colocar em "SEU_SEGREDO" na URL acima.
+// ATENÇÃO a um detalhe da Vercel: a função é ENCERRADA no instante em que a
+// resposta é enviada. Qualquer código depois de res.status() simplesmente não
+// roda. Por isso a gravação é aguardada ANTES de responder, e o disparo do
+// worker vai dentro de waitUntil(), que mantém a invocação viva até terminar.
 
-const { redisSet, redisDel } = require('./_redis');
+const { db } = require('../../lib/db');
+const { verifySignature } = require('../../lib/whatsapp');
 
-// Nomes de evento conhecidos (a Kiwify usa nomes em inglês tipo "order_approved",
-// mas guardamos também variantes em português por segurança).
-const APPROVE_EVENT_TYPES = new Set([
-  'order_approved', 'compra_aprovada', 'subscription_renewed', 'subscription_renewal'
-]);
-const REVOKE_EVENT_TYPES = new Set([
-  'order_refunded', 'order_refused', 'compra_reembolsada', 'compra_recusada',
-  'chargeback', 'chargedback', 'subscription_canceled', 'subscription_cancelled', 'subscription_late'
-]);
-
-// Valores conhecidos do campo "order_status" que a Kiwify sempre envia.
-const APPROVE_ORDER_STATUS = new Set(['paid', 'approved']);
-const REVOKE_ORDER_STATUS = new Set(['refunded', 'refused', 'chargedback', 'canceled', 'cancelled']);
-
-function extractEmail(body) {
-  const candidates = [
-    body?.Customer?.email,
-    body?.customer?.email,
-    body?.data?.Customer?.email,
-    body?.data?.customer?.email,
-    body?.data?.customer_email,
-    body?.customer_email,
-    body?.buyer?.email,
-    body?.data?.buyer?.email
-  ];
-  const found = candidates.find((e) => typeof e === 'string' && e.includes('@'));
-  return found ? found.toLowerCase().trim() : null;
+let waitUntil;
+try {
+  ({ waitUntil } = require('@vercel/functions'));
+} catch (e) {
+  // Fora da Vercel (ou sem o pacote), degrada para execução direta.
+  waitUntil = (p) => p;
 }
 
-function extractEventType(body) {
-  return (
-    body?.webhook_event_type ||
-    body?.event ||
-    body?.trigger ||
-    body?.type ||
-    ''
-  ).toString().toLowerCase();
-}
+// Precisamos do corpo cru para conferir a assinatura HMAC da Meta.
+module.exports.config = { api: { bodyParser: false } };
 
-function extractOrderStatus(body) {
-  return (body?.order_status || '').toString().toLowerCase();
-}
-
-function isApproveEvent(body) {
-  return APPROVE_EVENT_TYPES.has(extractEventType(body)) || APPROVE_ORDER_STATUS.has(extractOrderStatus(body));
-}
-
-function isRevokeEvent(body) {
-  return REVOKE_EVENT_TYPES.has(extractEventType(body)) || REVOKE_ORDER_STATUS.has(extractOrderStatus(body));
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 module.exports = async function handler(req, res) {
+  // --- verificação do webhook (a Meta chama uma vez, na configuração) ---
+  if (req.method === 'GET') {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+
+    if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
+      return res.status(200).send(challenge);
+    }
+    return res.status(403).send('Token de verificação inválido.');
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Método não permitido' });
   }
 
-  const expectedSecret = process.env.KIWIFY_WEBHOOK_SECRET;
-  const providedSecret = req.query?.token;
-
-  if (!expectedSecret) {
-    console.error('KIWIFY_WEBHOOK_SECRET não configurado no servidor.');
-    return res.status(500).json({ error: 'Servidor não configurado.' });
-  }
-  if (providedSecret !== expectedSecret) {
-    console.error('Webhook recebido com token inválido.');
-    return res.status(401).json({ error: 'Token inválido.' });
-  }
-
-  const body = req.body || {};
-  const eventType = extractEventType(body);
-  const orderStatus = extractOrderStatus(body);
-  console.log(`Webhook Kiwify recebido — evento: "${eventType}", order_status: "${orderStatus}"`);
-
-  const email = extractEmail(body);
-
-  if (!email) {
-    console.error('Não encontrei e-mail no payload do webhook.');
-    return res.status(200).json({ received: true, warning: 'email não encontrado' });
-  }
-
+  let raw, body;
   try {
-    if (isApproveEvent(body)) {
-      await redisSet(`paid:${email}`, '1');
-      console.log(`Acesso LIBERADO para ${email} (evento: ${eventType}, status: ${orderStatus})`);
-    } else if (isRevokeEvent(body)) {
-      await redisDel(`paid:${email}`);
-      console.log(`Acesso REVOGADO para ${email} (evento: ${eventType}, status: ${orderStatus})`);
-    } else {
-      console.log(`Evento "${eventType}" (status: "${orderStatus}") não mapeado como aprovação nem revogação, ignorando.`);
-    }
-    return res.status(200).json({ received: true });
-  } catch (err) {
-    console.error('Erro ao processar webhook:', err);
-    return res.status(500).json({ error: 'Erro interno.' });
+    raw = await readRawBody(req);
+    body = JSON.parse(raw.toString('utf8'));
+  } catch (e) {
+    return res.status(400).json({ error: 'Corpo inválido.' });
   }
+
+  if (!verifySignature(raw, req.headers['x-hub-signature-256'])) {
+    console.error('Webhook com assinatura inválida — descartado.');
+    return res.status(401).json({ error: 'Assinatura inválida.' });
+  }
+
+  const supabase = db();
+  const jobs = [];
+
+  // --- gravação na fila: AGUARDADA, antes de responder ---
+  try {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+
+        for (const status of value.statuses || []) {
+          await supabase.from('whatsapp_messages')
+            .update({ status: status.status })
+            .eq('wa_message_id', status.id)
+            .then(() => {}, () => {});
+        }
+
+        const contactName = value.contacts?.[0]?.profile?.name || null;
+
+        for (const msg of value.messages || []) {
+          const supported = ['text', 'image', 'interactive', 'button'];
+          if (!supported.includes(msg.type)) {
+            jobs.push({ unsupported: true, waId: msg.from, type: msg.type });
+            continue;
+          }
+
+          let text = null, mediaId = null, buttonId = null;
+          if (msg.type === 'text') text = msg.text?.body || '';
+          if (msg.type === 'image') { mediaId = msg.image?.id; text = msg.image?.caption || null; }
+          if (msg.type === 'interactive') buttonId = msg.interactive?.button_reply?.id || msg.interactive?.list_reply?.id || null;
+          if (msg.type === 'button') { text = msg.button?.text || null; buttonId = msg.button?.payload || null; }
+
+          // A partir de 2026 o campo `from` pode trazer um BSUID em vez do
+          // telefone, quando a usuária adota nome de usuário no WhatsApp.
+          const sender = msg.from || value.contacts?.[0]?.user_id || msg.user_id;
+          if (!sender) {
+            console.error('Mensagem sem identificador de remetente:', msg.id);
+            continue;
+          }
+
+          // Idempotência: a Meta reenvia quando não recebe 200 a tempo.
+          const { data: dup } = await supabase.from('whatsapp_messages')
+            .select('id').eq('wa_message_id', msg.id).maybeSingle();
+          if (dup) continue;
+
+          await supabase.from('whatsapp_messages').insert({
+            direction: 'inbound',
+            wa_message_id: msg.id,
+            status: 'queued',
+            payload: { from: sender, type: msg.type, text, mediaId, buttonId, profileName: contactName }
+          });
+
+          jobs.push({ waId: sender, profileName: contactName, text, mediaId, buttonId, waMessageId: msg.id });
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Erro ao enfileirar mensagem:', e.message);
+  }
+
+  console.log(`Webhook recebeu ${jobs.length} mensagem(ns) para processar.`);
+
+  // --- disparo do worker dentro de waitUntil ---
+  // Sem isto, a Vercel mata a função assim que a resposta sai e o worker
+  // nunca é chamado. Foi exatamente esse o bug da primeira versão.
+  if (jobs.length) {
+    const base = process.env.PUBLIC_BASE_URL || `https://${req.headers.host}`;
+
+    waitUntil(
+      fetch(`${base}/api/whatsapp/process`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-internal-secret': process.env.INTERNAL_SECRET || ''
+        },
+        body: JSON.stringify({ jobs })
+      })
+        .then((r) => console.log(`Worker acionado — status ${r.status}`))
+        .catch((e) => console.error('Falha ao acionar o worker:', e.message))
+    );
+  }
+
+  return res.status(200).json({ received: true, queued: jobs.length });
 };
